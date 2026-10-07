@@ -8,6 +8,15 @@ readability-first philosophy (`docs/devnotes.md`). See the companion
 optimization proposal (chat history / `CLAUDE.md` summary) for the full
 findings this plan is based on.
 
+**Start here if picking this up fresh:** read the "Phase 0 addendum" section
+below before touching Phase 1. It has real profiling/benchmark evidence
+(not just code-inspection reasoning) for why Phase 1's scope is what it is —
+in particular, a plausible-looking objection ("your benchmark makes compute
+look like the bottleneck, not I/O") turned out to be a real methodology gap,
+and chasing it down changed Phase 1's scope. Don't skip straight to the
+checklists without that context, or you'll likely re-raise the same question
+and re-do the investigation.
+
 **Ground rule for every phase below:** no phase is "done" until its diff has
 been checked against the Phase 0 regression baseline with matching output
 (within float tolerance) on `tests/testdata/dHybridR/M06_th45/`.
@@ -82,10 +91,140 @@ Reproduce with: `FPCAnalysisenv/bin/python scripts/bench_fpc.py --scales 1e5,1e6
 
 ---
 
-## Phase 1 — Stop loading full frames before filtering (highest impact)
+## Phase 0 addendum — benchmarking evidence that revised Phase 1's scope — DONE
 
-Targets findings #1-#3 from the proposal. This is the actual ceiling on
-dataset size today.
+**Why this addendum exists:** after Phase 0 landed, a reasonable objection
+was raised against the baseline table above: it makes `compute_hist_and_cor`
+look like the dominant cost relative to particle load, which seemed to
+contradict the original proposal's claim that full-frame loading (not
+per-particle compute) is the real ceiling on dataset size. That objection was
+correct to raise — the Phase 0 benchmark's `load` step reads back a file it
+had just written containing *exactly* the particles the compute step then
+uses, so it never exercises the "load everything, use a slice of it" pattern
+that the proposal was actually about. Two follow-up benchmarks were built to
+settle this with real decomposed numbers instead of one ambiguous table.
+
+### Part A — `scripts/bench_sweep_redundancy.py`: is the redundant per-call filtering real?
+
+`fpc.py` has a self-documented TODO (`fpc.py:210`, "lot of redundancy in this
+library... compute Hist redundantly... dont compute subset each time for
+CEx, CEy, CEz"). Concretely: `fpc.compute_correlation_over_x` calls
+`compute_hist_and_cor` once per field key (`ex`,`ey`,`ez`) per slice, and each
+call independently rebuilds the `gptsparticle` boolean mask over the
+**entire** in-memory particle array — cost `O(n_total)` per call, not
+`O(particles actually in the box)` — plus redundantly runs `np.histogramdd`
+twice (once unweighted for `hist`, once weighted for `cprimebinned`).
+
+Method: profiled (`cProfile`, aggregated automatically across repeated
+calls) a real `fpc.compute_correlation_over_x` sweep over one large in-memory
+synthetic particle set, at a few different slice counts for a fixed swept
+width, isolating `compute_hist_and_cor`'s own (non-subcall) time as
+"filter overhead", `compute_cprimew`'s time as "JIT loop", and
+`histogramdd`/`searchsorted` time as "histogram". Each run executes in its
+own subprocess for a clean profiler/JIT state.
+
+| n_total | slices (requested) | wall (s) | filter overhead (s) | JIT loop (s) | filter % of total |
+|---|---|---|---|---|---|
+| 1e6 | 10 | 0.59 | 0.115 | 0.310 | 19% |
+| 1e6 | 50 | 0.96 | 0.338 | 0.347 | 35% |
+| 1e6 | 191 | 1.89 | 0.890 | 0.379 | 47% |
+| 1e6 | 500 | 3.78 | 1.993 | 0.433 | 53% |
+| 1e7 | 10 | 5.69 | 1.224 | 2.948 | 22% |
+| 1e7 | 50 | 9.91 | 4.569 | 3.287 | 46% |
+| 1e7 | 191 | 19.41 | 12.523 | 3.441 | 65% |
+| 1e7 | 500 | 35.98 | 26.120 | 3.310 | 73% |
+
+(191 slices was chosen because it's what `dx=0.5` over this fixture's domain
+works out to — i.e. the repo's own `analysisinput.txt` example parameters,
+not an arbitrary round number.)
+
+**Finding, confirmed not just hypothesized:** JIT compute time stays roughly
+flat as slice count grows at fixed `n_total` (expected — same total particles,
+redistributed into more/smaller boxes). Filter overhead grows ~linearly with
+slice count and, at a realistic slice count, is already **47-73% of total
+sweep time** — a bigger current wall-clock cost than the per-particle JIT
+loop in exactly the sweep pattern this library's own example config produces.
+
+### Part B — `scripts/bench_io_full_vs_filtered.py`: is the full-load RAM ceiling real?
+
+Compares the two loaders that *already exist* for dHybridR — no new
+production code needed to get this evidence:
+- `data_dhybridr.read_particles` (current default, always full-load)
+- `data_dhybridr.read_box_of_particles` (already in the codebase, does a
+  bounds-filtered h5py read)
+
+against the same on-disk synthetic "frame" file, both asked for only a 1%
+spatial slice of it. Each (scale, mode) pair runs in its own subprocess so
+peak-RSS readings (`resource.getrusage`, a cumulative watermark) aren't
+contaminated across comparisons.
+
+| n_total | mode | peak RSS (MB) | elapsed (s) |
+|---|---|---|---|
+| 1e6 | full | 231.5 | 0.006 |
+| 1e6 | filtered | 200.1 | 0.009 |
+| 1e7 | full | 667.4 | 0.053 |
+| 1e7 | filtered | 297.6 | 0.101 |
+| 1e8 | full | 4954.4 | 0.823 |
+| 1e8 | filtered | 1330.0 | 1.123 |
+
+**Finding, confirmed:** at 1e8 particles, full-load peak RSS is **3.7x**
+higher than the filtered load — real, and it's specifically the thing that
+gates whether a dataset fits in RAM at all, independent of wall-clock
+considerations. **Finding, unexpected — must inform Phase 1's implementation:**
+the filtered loader is currently *slower* in wall time at every scale tested,
+not faster. It trades time for memory today, it does not win on both axes.
+Root cause: `read_box_of_particles` still reads the full `x1`/`x2`/`x3`
+arrays into memory to build its boolean mask before doing h5py fancy-indexed
+reads per key — this is the same inefficiency already called out in Phase
+1's `get_dpar_from_bounds`/`read_box_of_particles` bullets below, now with a
+measured cost attached to it.
+
+### Conclusion — how this changes Phase 1's scope (see updated checklist below)
+
+Both halves of the original proposal's reasoning hold up under evidence, but
+the *priority and scope* needed revision:
+1. The compute-redundancy fix (dedup `gptsparticle` + the double
+   `histogramdd`) is a **new finding, surfaced only by this profiling** — the
+   original proposal noted the `fpc.py:210` TODO comment existed but did not
+   catalogue it as its own finding or give it a phase/task of its own.
+   Evidence now says it belongs in Phase 1: it's a bigger current wall-clock
+   cost than anything else identified so far, it's cheap and low-risk to
+   fix, and it's orthogonal to the I/O work (different file, `fpc.py` vs
+   `data_*.py`), so there's no reason to defer it. **Added to Phase 1 below
+   as a new item.**
+2. The I/O/RAM ceiling is real and still the thing that decides whether a
+   10-100x larger dataset can be attempted at all — but "just redirect
+   callers to the already-filtered loader" is not sufficient on its own, per
+   the time-vs-memory tradeoff found above. Phase 1's `read_box_of_particles`
+   fix needs to actually close that gap, not just inherit it.
+
+---
+
+## Phase 1 — Stop loading full frames before filtering, and stop redundant per-slice filtering (highest impact, evidence-backed)
+
+Targets findings #1-#3 from the original proposal, **plus** the Part A
+redundancy finding above (a new finding surfaced by benchmarking after Phase
+0, not previously catalogued, added here because it dominates realistic
+sweep wall-time more than anything else identified so far — see the Phase 0
+addendum above). This phase now addresses both halves of "the actual
+ceiling on dataset size today": peak RAM during load, and redundant
+repeated work during a sweep.
+
+- [ ] `[ ]` **`fpc.py:compute_correlation_over_x` / `comp_cor_over_x_multithread`
+      / `compute_hist_and_cor` / `compute_cprime_hist`** (new item — see
+      Part A evidence above): restructure so the
+      `gptsparticle` boolean-mask filtering happens **once per slice**, not
+      once per field-key call (`ex`,`ey`,`ez`, and again for `etot`/FAC
+      variants) — e.g. have the sweep driver filter to the slice's particle
+      subset once and pass that subset into each per-field-key call, rather
+      than each call re-filtering the full array. Separately, eliminate the
+      redundant double `np.histogramdd` call in `compute_cprime_hist`
+      (compute the unweighted `hist` and weighted `cprimebinned` without
+      binning twice — e.g. derive one from the other, or bin once with both
+      a counts array and a weighted-sum array in a single pass). Re-run
+      `scripts/bench_sweep_redundancy.py` after this change; filter-overhead
+      share of total sweep time should drop back toward the ~20% floor seen
+      at low slice counts, at any slice count.
 
 - [ ] `[ ]` **`data_tristan.py:load_particles`**: add an optional spatial
       bounds parameter (`x1,x2,y1,y2,z1,z2=None`) that, when given, filters
@@ -98,6 +237,12 @@ dataset size today.
       `x1`/`x2`/`x3` twice (once to build the mask, again implicitly via
       fancy indexing) — read position arrays once into local numpy arrays,
       build the combined mask, then index each dataset once per key.
+      **Measured cost of not fixing this** (Part B, above): at 1e8 particles
+      requesting a 1% slice, this loader already wins 3.7x on peak RSS
+      (1330MB vs 4954MB) but is *slower* in wall time than a full load
+      (1.123s vs 0.823s) — the fix above should close that time gap, not
+      just preserve the RAM win. Re-run `scripts/bench_io_full_vs_filtered.py`
+      after this fix; filtered mode should win on both RSS and elapsed time.
 - [ ] `[ ]` **`preslicedataTristan.py` / `preslicedataTristan.py`-equivalent
       for dHybridR**: switch the preslicing scripts to use the new bounds-
       filtered loader per x-slice instead of loading the whole frame once and
@@ -118,10 +263,15 @@ dataset size today.
       loop (quadratic reallocation) with collecting into a list and doing one
       `np.concatenate` after the loop.
 
-**Acceptance:** Phase 0 golden tests still pass. Benchmark script shows peak
-RSS during preslicing no longer scales with total frame particle count when a
-spatial subset is requested — scales with subset size instead. Re-run the
-Phase 0 benchmark table at the same scales and record deltas.
+**Acceptance:** Phase 0 golden tests still pass (`pytest tests/`). Peak RSS
+during preslicing/loading no longer scales with total frame particle count
+when a spatial subset is requested — scales with subset size instead:
+re-run `scripts/bench_io_full_vs_filtered.py` and confirm the filtered mode
+wins on *both* peak RSS and elapsed time (not just RSS, per the gap found
+above). Re-run `scripts/bench_sweep_redundancy.py` and confirm filter-overhead
+share of total sweep time no longer grows with slice count. Re-run
+`scripts/bench_fpc.py` at the same scales as the Phase 0 table and record
+deltas.
 
 ---
 

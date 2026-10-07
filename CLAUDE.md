@@ -99,9 +99,24 @@ FPCAnalysisenv/bin/python tests/testload.py
 FPCAnalysisenv/bin/python tests/testframetransform.py
 ```
 
-`scripts/bench_fpc.py` benchmarks particle load + `compute_hist_and_cor` at
-a few synthetic particle-count scales with isolated per-scale peak-RSS
-measurement — use it to get before/after numbers for any optimization phase.
+Three benchmark scripts exist under `scripts/`, each answering a different
+question — use the right one rather than re-deriving its answer by hand:
+- `bench_fpc.py`: particle load + `compute_hist_and_cor` at a few synthetic
+  particle-count scales, isolated per-scale peak-RSS measurement.
+- `bench_sweep_redundancy.py`: profiles a *real* `compute_correlation_over_x`
+  sweep (not a single isolated call) to decompose time into per-call
+  filtering overhead vs. JIT compute vs. histogram binning, across slice
+  counts. Built because `bench_fpc.py` alone was misleading about where time
+  actually goes in a realistic multi-slice sweep — see
+  `docs/optimization_plan.md`'s "Phase 0 addendum" for why and what it found.
+- `bench_io_full_vs_filtered.py`: compares `data_dhybridr.read_particles`
+  (full-load) against `data_dhybridr.read_box_of_particles` (bounds-filtered)
+  on the same on-disk file, to isolate the actual I/O/RAM-ceiling question
+  from compute cost.
+
+Read `docs/optimization_plan.md`'s "Phase 0 addendum" section before
+assuming you know which of these to reach for, or before re-benchmarking
+something these three already measured.
 
 ## Environment
 
