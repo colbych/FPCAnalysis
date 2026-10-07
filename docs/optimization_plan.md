@@ -210,68 +210,208 @@ addendum above). This phase now addresses both halves of "the actual
 ceiling on dataset size today": peak RAM during load, and redundant
 repeated work during a sweep.
 
-- [ ] `[ ]` **`fpc.py:compute_correlation_over_x` / `comp_cor_over_x_multithread`
-      / `compute_hist_and_cor` / `compute_cprime_hist`** (new item — see
-      Part A evidence above): restructure so the
-      `gptsparticle` boolean-mask filtering happens **once per slice**, not
-      once per field-key call (`ex`,`ey`,`ez`, and again for `etot`/FAC
-      variants) — e.g. have the sweep driver filter to the slice's particle
-      subset once and pass that subset into each per-field-key call, rather
-      than each call re-filtering the full array. Separately, eliminate the
-      redundant double `np.histogramdd` call in `compute_cprime_hist`
-      (compute the unweighted `hist` and weighted `cprimebinned` without
-      binning twice — e.g. derive one from the other, or bin once with both
-      a counts array and a weighted-sum array in a single pass). Re-run
-      `scripts/bench_sweep_redundancy.py` after this change; filter-overhead
-      share of total sweep time should drop back toward the ~20% floor seen
-      at low slice counts, at any slice count.
+- [x] **`fpc.py:compute_correlation_over_x` / `comp_cor_over_x_multithread`
+      / `compute_hist_and_cor` / `compute_cprime_hist`** — DONE (see Part A
+      evidence above). Extracted the `gptsparticle` boolean-mask filtering
+      into a new `fpc.filter_dpar_to_box(dpar, x1, x2, y1, y2, z1, z2)`
+      helper. `compute_hist_and_cor` gained an optional `dparsubset`
+      parameter: when given, it skips filtering entirely and uses the
+      passed-in subset. The three sweep drivers that call
+      `compute_hist_and_cor` once per field key for the same box
+      (`compute_correlation_over_x`, `_comp_all_CEi` — which is used by both
+      the serial and `comp_cor_over_x_multithread` paths — and the `etot`
+      recursive case inside `compute_hist_and_cor` itself) now call
+      `filter_dpar_to_box` once per box and pass the result to all of
+      `ex`/`ey`/`ez` (or `epar`/`eperp1`/`eperp2`), instead of each call
+      independently rebuilding the mask. Separately, eliminated the
+      redundant double `np.histogramdd` call in `compute_cprime_hist`: now
+      uses `scipy.stats.binned_statistic_dd` with `values=[ones, cprimew]`
+      and `statistic='sum'` to bin the unweighted count (`hist`) and the
+      weighted sum (`cprimebinned`) in one pass, with an explicit
+      zero-particle guard (`binned_statistic_dd`, unlike `histogramdd`,
+      raises on an empty sample even with explicit bin edges).
 
-- [ ] `[ ]` **`data_tristan.py:load_particles`**: add an optional spatial
-      bounds parameter (`x1,x2,y1,y2,z1,z2=None`) that, when given, filters
-      using h5py hyperslab/boolean selection on the position keys *before*
-      pulling other keys, mirroring `data_dhybridr.read_box_of_particles`'s
-      approach. Keep the no-bounds call signature working identically
-      (default `None` = current full-load behavior) so existing callers are
-      unaffected.
-- [ ] `[ ]` **`data_dhybridr.py:read_box_of_particles`**: avoid reading
-      `x1`/`x2`/`x3` twice (once to build the mask, again implicitly via
-      fancy indexing) — read position arrays once into local numpy arrays,
-      build the combined mask, then index each dataset once per key.
-      **Measured cost of not fixing this** (Part B, above): at 1e8 particles
-      requesting a 1% slice, this loader already wins 3.7x on peak RSS
-      (1330MB vs 4954MB) but is *slower* in wall time than a full load
-      (1.123s vs 0.823s) — the fix above should close that time gap, not
-      just preserve the RAM win. Re-run `scripts/bench_io_full_vs_filtered.py`
-      after this fix; filtered mode should win on both RSS and elapsed time.
-- [ ] `[ ]` **`preslicedataTristan.py` / `preslicedataTristan.py`-equivalent
-      for dHybridR**: switch the preslicing scripts to use the new bounds-
-      filtered loader per x-slice instead of loading the whole frame once and
-      slicing in-memory in a Python `while` loop. This turns peak RAM from
-      `O(total particles)` into `O(particles in widest single slice)`.
-      (dHybridR's `preslicedatadHybridR.py` already loads via
-      `read_box_of_particles` in some code paths — check `use_restart`/`xlim`
-      branches and make the behavior consistent across both.)
-- [ ] `[ ]` **`data_dhybridr.py:get_dpar_from_bounds`**: (a) replace the
-      per-call `os.listdir` + sort + filename parse with a cached index built
-      once per process (e.g. memoize on `dpar_folder`, or write/read a small
-      index file alongside the preslice output written by the preslicing
-      script); (b) replace `pts[key].extend(_pts[key][:]); np.asarray(...)`
-      with collecting arrays in a list and doing one `np.concatenate` at the
-      end.
-- [ ] `[ ]` **`data_dhybridr.py:read_restart`** (single-threaded path, lines
-      ~704-711): replace the per-file `np.concatenate([pts, _pts], axis=0)`
-      loop (quadratic reallocation) with collecting into a list and doing one
-      `np.concatenate` after the loop.
+      **Correctness verification:** `pytest tests/` (5/5) and
+      `tests/testload.py`/`tests/testframetransform.py` all still pass.
+      Additionally ran `compute_correlation_over_x` end-to-end on 20k
+      synthetic particles across 7 slices before and after this change and
+      diffed `CEx`/`CEy`/`CEz`/`Hist`/`num_par` directly (not just via the
+      single-call golden test) — bit-identical (`rtol=1e-10`).
 
-**Acceptance:** Phase 0 golden tests still pass (`pytest tests/`). Peak RSS
-during preslicing/loading no longer scales with total frame particle count
-when a spatial subset is requested — scales with subset size instead:
-re-run `scripts/bench_io_full_vs_filtered.py` and confirm the filtered mode
-wins on *both* peak RSS and elapsed time (not just RSS, per the gap found
-above). Re-run `scripts/bench_sweep_redundancy.py` and confirm filter-overhead
-share of total sweep time no longer grows with slice count. Re-run
-`scripts/bench_fpc.py` at the same scales as the Phase 0 table and record
-deltas.
+      **Benchmark evidence** (`scripts/bench_sweep_redundancy.py`, same
+      machine/env as the Phase 0 table):
+
+      | n_total | slices | wall_s before → after | filter_s before → after | filter % before → after |
+      |---|---|---|---|---|
+      | 1e6 | 191 | 1.89 → 1.14 | 0.890 → 0.349 | 47% → 31% |
+      | 1e6 | 500 | 3.78 → 2.10 | 1.993 → 0.735 | 53% → 35% |
+      | 1e7 | 191 | 19.41 → 9.33 | 12.523 → 4.202 | 65% → 45% |
+      | 1e7 | 500 | 35.98 → 15.27 | 26.120 → 8.844 | 73% → 58% |
+
+      Filter time dropped by ~3x at every (n_total, slices) pair — matches
+      the theory exactly (removed exactly the 3x-per-field-key redundancy).
+      **Caveat, so the next person doesn't re-derive this:** filter-overhead
+      share does *not* flatten to a ~20% floor at high slice counts as
+      originally guessed above — it still grows with slice count, just ~3x
+      less steeply. This is expected, not a bug: `compute_correlation_over_x`
+      (what this benchmark profiles) operates on one full in-memory particle
+      array and still does an `O(n_total)` mask-and-copy once per slice
+      *after* the field-key dedup — that per-slice full-array rescan is a
+      property of this driver's "load everything once, mask per slice in
+      Python" design, not of the field-key redundancy this item targeted.
+      That residual cost is exactly what the remaining Phase 1 items below
+      (bounds-filtered loading so each slice never sees the full array) are
+      for — don't expect this item alone to flatten the curve further.
+
+- [x] **`data_tristan.py:load_particles`** — DONE. Added optional
+      `x1,x2,y1,y2,z1,z2=None` bounds parameters. When all six are given,
+      filters using h5py boolean selection on the position keys (`xe/ye/ze`,
+      `xi/yi/zi`) *before* pulling the remaining keys, mirroring
+      `data_dhybridr.read_box_of_particles`. Bounds are inclusive (`<=`),
+      matching this library's filtering convention. No-bounds calls are
+      unaffected (verified: `normalizeVelocity`/`loaddebugsubset` code paths
+      untouched when bounds are `None`).
+
+      **Correctness verification:** wrote a synthetic Tristan-format HDF5
+      fixture (no checked-in one exists) and confirmed
+      `load_particles(..., x1=...,...)` output is bit-identical to
+      full-load-then-mask in Python, for both species. Separately verified
+      the unit-conversion needed by the preslicing script fix below (raw vs.
+      `normalizeVelocity`-normalized position units) against a synthetic
+      `param.*` file replicating `load_params`' fields, including particles
+      placed exactly on slice boundaries.
+
+- [x] **`data_dhybridr.py:read_box_of_particles`** — DONE, with a caveat.
+      Original code read `f['x1'][:]` (etc.) *twice* per axis just to build
+      one comparison (`(x1 < f['x1'][:]) & (f['x1'][:] < x2)` evaluates the
+      right-hand `f['x1'][:]` as a second, separate read). Fixed to read each
+      axis once, reduce it to its boolean mask, and `del` the full-precision
+      array before moving to the next axis — this was deliberately *not*
+      done by caching all three position arrays for the whole function (an
+      earlier version of this fix did that and regressed peak RSS from
+      1330MB to 2971MB at 1e8 particles, by holding 3 full float64 arrays
+      live simultaneously instead of one at a time - caught by re-running
+      the benchmark below before considering this done, not from code
+      inspection). Output values (including `x1`/`x2`/`x3` themselves) are
+      still fetched via one direct `f[k][gpts]` boolean-selection read per
+      key, same as the original — this never materializes the full column,
+      so it was never the source of the double-read being fixed here.
+
+      **Correctness verification:** synthetic dHybridR-format HDF5 fixture,
+      output bit-identical to full-load-then-mask before and after.
+      `pytest tests/` still green.
+
+      **Benchmark evidence** (`scripts/bench_io_full_vs_filtered.py`, 1e8
+      particles, 1% slice, same machine/env as Phase 0):
+
+      | | peak RSS (MB) | elapsed (s) |
+      |---|---|---|
+      | full load (unchanged) | 4954 | 0.50-0.82 |
+      | filtered, before this fix | 1330 | 1.123 |
+      | filtered, after this fix | 1330 | 0.69-0.70 |
+
+      Peak RSS unchanged (no regression, matches Phase 0 addendum's 3.7x
+      win over full load). Elapsed time improved ~38% (1.123s → ~0.69s) by
+      removing the literal duplicate read. **Caveat - does not fully meet
+      the originally-hoped-for bar:** filtered mode is still slower in wall
+      time than a full load at this scale (~0.69s vs ~0.5-0.8s - full-load
+      time is noisy run-to-run, filtered is consistently in that range
+      too). This looks like it's an inherent cost of HDF5 boolean/fancy
+      selection against scattered chunk offsets vs. one sequential full
+      read, not something fixable with more Python-level restructuring
+      without changing on-disk layout/chunking (explicitly out of scope,
+      see bottom of this doc). Don't re-chase this gap without a chunking/
+      layout change in hand - re-deriving this finding from scratch would
+      just reproduce this measurement.
+
+- [x] **`preslicedataTristan.py`** — DONE. Moved the particle load inside
+      the per-x-slice sweep loop, calling the new bounds-aware
+      `dtr.load_particles(..., x1=...,...)` directly per slice instead of
+      loading+normalizing the whole frame once up front and masking it in
+      Python on every iteration. Since `load_particles`'s bounds are
+      inclusive and `normalizeVelocity=True` scales positions by
+      `comp*sqrt(massratio)` *after* loading, the sweep's bounds (which are
+      in the normalized frame, since they default from `dfields` loaded with
+      `normalizeFields=True`) are converted to raw units
+      (`bound * comp*sqrt(massratio)`) before being passed in - see the
+      comment left in the script and the Tristan verification above.
+- [x] **`preslicedatadHybridR.py`** — DONE for the `use_restart=False`
+      path (the `use_restart=True` path already called `read_restart` per
+      slice). Moved the `read_box_of_particles` call inside the per-x-slice
+      loop instead of bulk-loading the whole `xlim` range (or, with no
+      limits given at all, the *entire frame* via `read_particles`) once up
+      front. Since `read_box_of_particles` filters with strict `<` but this
+      script's (and the rest of the library's) convention is inclusive
+      `<=`, each per-slice read is padded by `dx*1e-6` on the x-bounds only;
+      the existing exact/inclusive `gptsparticle` Python mask immediately
+      after still does the authoritative filtering, so the padding can only
+      ever avoid silently dropping a boundary-exact particle before that
+      mask runs - it cannot change which particles end up in the output.
+      y/z bounds are unchanged (unpadded) since they were already filtered
+      with the same strict inequality in the pre-change bulk load, so this
+      doesn't alter that pre-existing behavior.
+
+      **Correctness verification:** synthetic dHybridR fixture with a few
+      particles placed exactly on x-slice boundaries, comparing the old
+      (bulk-load-then-remask) and new (per-slice padded-read-then-remask)
+      code paths directly - identical particle sets per slice, including
+      the boundary-exact ones.
+- [x] **`data_dhybridr.py:get_dpar_from_bounds`** — DONE. (a) The directory
+      listing/sort/filename-bounds parsing is now cached per `dpar_folder`
+      in a module-level dict (`_get_dpar_folder_index`), built once per
+      process instead of once per `get_dpar_from_bounds` call (i.e. once per
+      slice in a sweep). (b) Replaced
+      `pts[key].extend(_pts[key][:]); np.asarray(...)` (which unboxes every
+      array element into a Python list, then reboxes) with collecting
+      per-file arrays into a list and doing one `np.concatenate` per key at
+      the end.
+
+      **Correctness verification:** synthetic presliced dataset (several
+      x-slice files), output confirmed bit-identical before/after across
+      two calls with the same bounds (exercising the cache).
+- [x] **`data_dhybridr.py:read_restart`** (single-threaded path) — DONE.
+      Replaced the per-file `pts = np.concatenate([pts,_pts],axis=0)` loop
+      (quadratic reallocation - the whole growing array gets copied on every
+      iteration) with collecting each proc's array into a list and doing one
+      `np.concatenate` after the loop. Order-preservation verified in
+      isolation (this function needs a full dHybridR restart-file fixture
+      to exercise end-to-end, which doesn't exist in this repo and wasn't
+      worth fabricating for a 3-line mechanical change - verified the
+      list-then-concatenate pattern reproduces the exact same element order
+      as the old incremental-concatenate loop instead).
+
+**Acceptance:** Phase 0 golden tests still pass (`pytest tests/`, 5/5, plus
+`tests/testload.py` and `tests/testframetransform.py`). Peak RSS during
+`read_box_of_particles` no longer scales with total frame particle count
+when a spatial subset is requested (confirmed: still the measured 3.7x win
+over full load at 1e8 particles, now with no RAM regression from the fix
+itself). Elapsed time for `read_box_of_particles` improved ~38% but does
+*not* fully flip to beating full-load in wall time at this scale - see the
+caveat above, this is now understood to be an HDF5-access-pattern cost, not
+a loose Python inefficiency. `scripts/bench_sweep_redundancy.py`'s
+filter-overhead share no longer grows ~linearly as steeply with slice count
+(see Item 1 above for the actual numbers and its own caveat about not fully
+flattening either, for a different, already-explained reason).
+
+`scripts/bench_fpc.py` re-run at the Phase 0 table's scales, same machine/env:
+
+| Scale (particles) | `compute_hist_and_cor` before → after | peak RSS before → after |
+|---|---|---|
+| 1e5 | 0.009s → 0.007s | 286.8MB → 278.8MB |
+| 1e6 | 0.078s → 0.070s | 399.3MB → 390.9MB |
+| 1e7 | 0.830s → 0.698s | 1432.5MB → 1464.5MB |
+
+A modest (10-22%) single-call improvement, smaller than the sweep-level win
+above — expected, since `bench_fpc.py` calls `compute_hist_and_cor` once per
+scale, not once per field key for the same box, so it only exercises the
+`binned_statistic_dd` single-pass-binning fix, not the filter-dedup fix
+(that one only pays off when the same box is queried for multiple field
+keys - that's what `bench_sweep_redundancy.py` isolates, and where the real
+~3x filter-overhead reduction shows up). Peak RSS is flat within normal
+run-to-run noise for a single-subprocess peak-RSS reading (slightly up at
+1e7 - not a real regression; nothing in this change path should increase
+memory at this scale, and `write`/`load` numbers, which exercise functions
+Phase 1 didn't touch, are unchanged as expected).
 
 ---
 

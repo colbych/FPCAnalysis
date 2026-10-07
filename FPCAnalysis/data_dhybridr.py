@@ -52,22 +52,26 @@ def read_particles(path, numframe=None, is2d3v = False):
 
     return pts
 
-def get_dpar_from_bounds(dpar_folder,x1,x2,verbose=False):
-    """
-    Loads all needed particle data files from dpar_folder which is created by preslicedata.py
+_dpar_folder_index_cache = {}
 
-    TODO: check user inputs to this func
+def _get_dpar_folder_index(dpar_folder):
     """
+    Returns (filenames, xbounds) for dpar_folder: the sorted presliced
+    filenames and their parsed [xlo,xhi] bounds.
+
+    Built once per process and cached, instead of re-running os.listdir +
+    sort + filename parsing on every get_dpar_from_bounds call - that call
+    happens once per slice in a sweep (see docs/optimization_plan.md Phase
+    1), so this was O(n_files) work repeated O(n_slices) times for data that
+    never changes within a process.
+    """
+    if(dpar_folder in _dpar_folder_index_cache):
+        return _dpar_folder_index_cache[dpar_folder]
+
     import os
-
-    if(x2 < x1):
-        print("Warning, x1 should be less than x2")
-        return
 
     filenames = os.listdir(dpar_folder)
     filenames = sorted(filenames)
-    # print("Found files...")
-    # #print(filenames)
     try:
         filenames.remove('.DS_store')
     except:
@@ -77,6 +81,22 @@ def get_dpar_from_bounds(dpar_folder,x1,x2,verbose=False):
     for f in filenames:
         bounds = f.split('_')
         xbounds.append([float(bounds[0]),float(bounds[1])])
+
+    _dpar_folder_index_cache[dpar_folder] = (filenames, xbounds)
+    return filenames, xbounds
+
+def get_dpar_from_bounds(dpar_folder,x1,x2,verbose=False):
+    """
+    Loads all needed particle data files from dpar_folder which is created by preslicedata.py
+
+    TODO: check user inputs to this func
+    """
+
+    if(x2 < x1):
+        print("Warning, x1 should be less than x2")
+        return
+
+    filenames, xbounds = _get_dpar_folder_index(dpar_folder)
 
     leftmostbound_index = -1 #must lag by one to capture all wanted slices
     testidx = 0
@@ -128,13 +148,15 @@ def get_dpar_from_bounds(dpar_folder,x1,x2,verbose=False):
         pts['q'] = 1.
         return pts
 
-    pts = {'p1':[],'p2':[],'p3':[],'x1':[],'x2':[],'x3':[]}
+    #collect each key's per-file arrays and concatenate once at the end, instead of
+    #extending a plain Python list element-by-element (which unboxes every array
+    #element into the list) and converting back to an array afterwards
+    pts_parts = {'p1':[],'p2':[],'p3':[],'x1':[],'x2':[],'x3':[]}
     for f in filenames:
         _pts = read_particles(dpar_folder+f)
-        for key in pts.keys():
-            pts[key].extend(_pts[key][:])
-    for key in pts.keys():
-        pts[key]=np.asarray(pts[key])
+        for key in pts_parts.keys():
+            pts_parts[key].append(np.asarray(_pts[key]))
+    pts = {key: np.concatenate(parts) for key, parts in pts_parts.items()}
     pts['Vframe_relative_to_sim'] = 0.
 
     print("Done loading files from x1=",x1," to x2=",x2)
@@ -187,16 +209,37 @@ def read_box_of_particles(path, numframe, x1, x2, y1, y2, z1, z2, is2d3v = False
 
     pts = {}
     with h5py.File(path.format(numframe),'r') as f:
-        gptsx = (x1 < f['x1'][:] ) & (f['x1'][:] < x2)
-        gptsy = (y1 < f['x2'][:] ) & (f['x2'][:] < y2)
+        #build each axis's boolean mask from a single full read of that axis (the
+        #original code read e.g. f['x1'][:] twice per axis - once for each side of the
+        #`<` comparison), freeing each full-precision position array immediately after
+        #reducing it to its (much smaller) boolean mask, before reading the next axis -
+        #this keeps peak memory the same as the original (never more than one full
+        #position array alive at a time) while still cutting redundant reads. Output
+        #values (including x1/x2/x3 themselves) are then fetched via one direct h5py
+        #boolean-selection read per key, same as before - this never requires the full
+        #column in memory, so it does not reintroduce the redundancy being removed here.
+        full_x1 = f['x1'][:]
+        gptsx = (x1 < full_x1) & (full_x1 < x2)
+        del full_x1
+
+        full_x2 = f['x2'][:]
+        gptsy = (y1 < full_x2) & (full_x2 < y2)
+        del full_x2
+
         if(not(is2d3v)):
-            gptsz = (z1 < f['x3'][:] ) & (f['x3'][:] < z2)
+            full_x3 = f['x3'][:]
+            gptsz = (z1 < full_x3) & (full_x3 < z2)
+            del full_x3
+            gpts = gptsx & gptsy & gptsz
+        else:
+            gpts = gptsx & gptsy
+
         for k in dens_vars:
                 if(not(is2d3v)):
-                    pts[k] = f[k][gptsx & gptsy & gptsz][:]
+                    pts[k] = f[k][gpts][:]
                 else:
                     if(k != 'x3'):
-                        pts[k] = f[k][gptsx & gptsy][:]
+                        pts[k] = f[k][gpts][:]
     pts['Vframe_relative_to_sim'] = 0.
 
     if('SP01' in path or 'Sp01' in path or 'sp01' in path):
@@ -702,13 +745,16 @@ def read_restart(path,verbose=True,xlim=None,nthreads=1):
                                                     #TODO: optimize by restricting in
                                                     #yy and zz too
     if(nthreads == 1):
-        pts = PM.parts_from_num(procs[-1])
+        #collect each proc's array and concatenate once at the end, instead of
+        #re-concatenating the whole growing array on every iteration (quadratic
+        #reallocation - see docs/optimization_plan.md Phase 1)
+        pts_parts = [PM.parts_from_num(procs[-1])]
         procs = procs[:-1]
         for _c,_p in enumerate(procs):
             if(verbose):
                 print('loaded proc str(_p): '+ str(_c) + ' of ' + str(len(procs))) #TODO: fix this output, it does not report first loaded file above
-            _pts = PM.parts_from_num(_p)
-            pts = np.concatenate([pts,_pts],axis=0)
+            pts_parts.append(PM.parts_from_num(_p))
+        pts = np.concatenate(pts_parts, axis=0)
 
     else:
         from concurrent.futures import ProcessPoolExecutor

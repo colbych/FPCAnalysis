@@ -57,11 +57,11 @@ def _profile_breakdown(pr):
     total = 0.0
     for (_filename, _lineno, funcname), (_cc, _nc, tt, _ct, _callers) in stats.stats.items():
         total += tt
-        if funcname == 'compute_hist_and_cor':
+        if funcname in ('compute_hist_and_cor', 'filter_dpar_to_box'):
             buckets['filter_overhead'] += tt
         elif funcname == 'compute_cprimew':
             buckets['jit_loop'] += tt
-        elif funcname in ('histogramdd', 'searchsorted'):
+        elif funcname in ('histogramdd', 'searchsorted', 'binned_statistic_dd', '_bin_edges', '_bin_numbers', '_bincount'):
             buckets['histogram'] += tt
     buckets['other'] = total - sum(buckets.values())
     buckets['total'] = total

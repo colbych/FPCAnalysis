@@ -6,8 +6,74 @@ import numpy as np
 
 from numba import jit
 
+def filter_dpar_to_box(dpar, x1, x2, y1, y2, z1, z2):
+    """
+    Filters particle data down to the particles within the given spatial box.
+
+    Pulled out of compute_hist_and_cor so that callers which invoke
+    compute_hist_and_cor multiple times per box (once per field key: ex, ey,
+    ez, or epar/eperp1/eperp2) can filter once per box and pass the result
+    in via the dparsubset parameter, instead of every call independently
+    rebuilding this O(n_total) boolean mask over the full particle array
+    (see docs/optimization_plan.md Phase 1 - this was measured to be 47-73%
+    of total sweep wall time at realistic slice counts).
+
+    Parameters
+    ----------
+    dpar : dict
+        xx vx yy vy zz vz data dictionary from read_particles or read_box_of_particles
+    x1,x2,y1,y2,z1,z2 : float
+        spatial box bounds (inclusive)
+
+    Returns
+    -------
+    dparsubset : dict
+        particle subset within the box
+    totalPtcl : int
+        number of particles within the box
+    """
+    #change keys for backwards compat
+    if('xi' in dpar.keys()):
+        dpar['x1'] = dpar['xi']
+        dpar['x2'] = dpar['yi']
+        dpar['x3'] = dpar['zi']
+        dpar['p1'] = dpar['ui']
+        dpar['p2'] = dpar['vi']
+        dpar['p3'] = dpar['wi']
+    if('xe' in dpar.keys()):
+        dpar['x1'] = dpar['xe']
+        dpar['x2'] = dpar['ye']
+        dpar['x3'] = dpar['ze']
+        dpar['p1'] = dpar['ue']
+        dpar['p2'] = dpar['ve']
+        dpar['p3'] = dpar['we']
+
+    if(z1 != None and z2 != None):
+        gptsparticle = (x1 <= dpar['x1']) & (dpar['x1'] <= x2) & (y1 <= dpar['x2']) & (dpar['x2'] <= y2) & (z1 <= dpar['x3']) & (dpar['x3'] <= z2)
+    else:
+        gptsparticle = (x1 <= dpar['x1']) & (dpar['x1'] <= x2) & (y1 <= dpar['x2']) & (dpar['x2'] <= y2)
+
+    dpar_p1 = np.asarray(dpar['p1'][gptsparticle][:])
+    dpar_p2 = np.asarray(dpar['p2'][gptsparticle][:])
+    dpar_p3 = np.asarray(dpar['p3'][gptsparticle][:])
+
+    totalPtcl = np.sum(gptsparticle)
+
+    dparsubset = {
+        'q': dpar['q'],
+        'p1': dpar_p1,
+        'p2': dpar_p2,
+        'p3': dpar_p3,
+        'x1': dpar['x1'][gptsparticle][:],
+        'x2': dpar['x2'][gptsparticle][:],
+        'x3': dpar['x3'][gptsparticle][:],
+        'Vframe_relative_to_sim': dpar['Vframe_relative_to_sim']
+    }
+
+    return dparsubset, totalPtcl
+
 def compute_hist_and_cor(vmax, dv, x1, x2, y1, y2, z1, z2,
-                            dpar, dfields, fieldkey, directionkey = None, useBoxFAC = True, altcorfields = None, beta = None, massratio = None, c = None):
+                            dpar, dfields, fieldkey, directionkey = None, useBoxFAC = True, altcorfields = None, beta = None, massratio = None, c = None, dparsubset = None):
     """
     Computes distribution function and correlation wrt to given field
 
@@ -54,6 +120,12 @@ def compute_hist_and_cor(vmax, dv, x1, x2, y1, y2, z1, z2,
         fluct correlation in field aligned coordinates
     beta, massratio, c : floats, not inteded for user use!
         variables that have information to transform frames when using multicore. Not intended to be used by end user. (should leave as default value)
+    dparsubset : dict, opt
+        pre-filtered particle subset for this box, as returned by filter_dpar_to_box(dpar, x1, x2, y1, y2, z1, z2).
+        When provided, dpar/x1/x2/y1/y2/z1/z2 are not used to filter (dpar is ignored entirely) - this lets a
+        caller that needs multiple field keys for the same box (e.g. ex, ey, ez) filter once and reuse the
+        result instead of rebuilding the O(n_total) spatial mask on every call. Leave as default (None) for
+        normal single-call use.
 
     Returns
     -------
@@ -72,15 +144,19 @@ def compute_hist_and_cor(vmax, dv, x1, x2, y1, y2, z1, z2,
     """
 
     if(fieldkey == 'etot'):
+        #filter once and reuse for all three recursive calls below, instead of each one rebuilding the mask
+        if(dparsubset is None):
+            dparsubset, _ = filter_dpar_to_box(dpar, x1, x2, y1, y2, z1, z2)
+
         #recursive calls to compute 'etot'
         vx, vy, vz, totalPtcl, hist, cor = compute_hist_and_cor(vmax, dv, x1, x2, y1, y2, z1, z2,
-                            dpar, dfields, 'epar', useBoxFAC = useBoxFAC, altcorfields = altcorfields, beta = beta, massratio = massratio, c = c)
+                            dpar, dfields, 'epar', useBoxFAC = useBoxFAC, altcorfields = altcorfields, beta = beta, massratio = massratio, c = c, dparsubset = dparsubset)
         _, _, _, _, _hist, _cor = compute_hist_and_cor(vmax, dv, x1, x2, y1, y2, z1, z2,
-                            dpar, dfields, 'eperp1', useBoxFAC = useBoxFAC, altcorfields = altcorfields, beta = beta, massratio = massratio, c = c)
+                            dpar, dfields, 'eperp1', useBoxFAC = useBoxFAC, altcorfields = altcorfields, beta = beta, massratio = massratio, c = c, dparsubset = dparsubset)
         hist = hist+_hist
         cor = cor+_cor
         _, _, _, _, _hist, _cor = compute_hist_and_cor(vmax, dv, x1, x2, y1, y2, z1, z2,
-                            dpar, dfields, 'eperp2', useBoxFAC = useBoxFAC, altcorfields = altcorfields, beta = beta, massratio = massratio, c = c)
+                            dpar, dfields, 'eperp2', useBoxFAC = useBoxFAC, altcorfields = altcorfields, beta = beta, massratio = massratio, c = c, dparsubset = dparsubset)
         hist = hist+_hist
         cor = cor+_cor
 
@@ -164,42 +240,19 @@ def compute_hist_and_cor(vmax, dv, x1, x2, y1, y2, z1, z2,
         dpar['p2'] = dpar['ve']
         dpar['p3'] = dpar['we']
 
-    if(z1 != None and z2 != None):
-        gptsparticle = (x1 <= dpar['x1']) & (dpar['x1'] <= x2) & (y1 <= dpar['x2']) & (dpar['x2'] <= y2) & (z1 <= dpar['x3']) & (dpar['x3'] <= z2)
-    else:
-        gptsparticle = (x1 <= dpar['x1']) & (dpar['x1'] <= x2) & (y1 <= dpar['x2']) & (dpar['x2'] <= y2)
-
-    _vxdown = None
-    _vydown = None
-    _vzdown = None
-
-
     if(False): #TODO: reimplement this check by fixing boosts for particles... => dfields['Vframe_relative_to_sim'] != dpar['Vframe_relative_to_sim']):
         print("ERROR: particles and fields are not in the same frame...")
         return
+
+    if(dparsubset is None):
+        dparsubset, totalPtcl = filter_dpar_to_box(dpar, x1, x2, y1, y2, z1, z2)
     else:
-        dpar_p1 = np.asarray(dpar['p1'][gptsparticle][:])
-        dpar_p2 = np.asarray(dpar['p2'][gptsparticle][:])
-        dpar_p3 = np.asarray(dpar['p3'][gptsparticle][:])
-
-    totalPtcl = np.sum(gptsparticle)
-
-    # build dparticles subset using shifted particle data
-    dparsubset = {
-        'q': dpar['q'],
-        'p1': dpar_p1,
-        'p2': dpar_p2,
-        'p3': dpar_p3,
-        'x1': dpar['x1'][gptsparticle][:],
-        'x2': dpar['x2'][gptsparticle][:],
-        'x3': dpar['x3'][gptsparticle][:],
-        'Vframe_relative_to_sim': dpar['Vframe_relative_to_sim']
-    }
+        totalPtcl = len(dparsubset['x1'])
 
     if('q' in dpar.keys()):
         dparsubset['q'] = dpar['q']
 
-    cprimebinned, hist, vx, vy, vz = compute_cprime_hist(dparsubset, dfields, fieldkey, vmax, dv, useBoxFAC=useBoxFAC, altcorfields=altcorfields, beta = beta, massratio = massratio, c = c, vxdown=_vxdown,vydown=_vydown,vzdown=_vzdown)
+    cprimebinned, hist, vx, vy, vz = compute_cprime_hist(dparsubset, dfields, fieldkey, vmax, dv, useBoxFAC=useBoxFAC, altcorfields=altcorfields, beta = beta, massratio = massratio, c = c, vxdown=None,vydown=None,vzdown=None)
     del dparsubset
 
     cor = compute_cor_from_cprime(cprimebinned, vx, vy, vz, dv, directionkey)
@@ -224,10 +277,14 @@ def _comp_all_CEi(vmax, dv, x1, x2, y1, y2, z1, z2, dparticles, dfields, vshock,
     See documentation for compute_hist_and_cor
     """
 
-    vx, vy, vz, totalPtcl, Hist, CEx = compute_hist_and_cor(vmax, dv, x1, x2, y1, y2, z1, z2, dparticles, dfields, 'ex', 'x')
-    vx, vy, vz, totalPtcl, Hist, CEy = compute_hist_and_cor(vmax, dv, x1, x2, y1, y2, z1, z2, dparticles, dfields, 'ey', 'y')
-    vx, vy, vz, totalPtcl, Hist, CEz = compute_hist_and_cor(vmax, dv, x1, x2, y1, y2, z1, z2, dparticles, dfields, 'ez', 'z')
-        
+    #filter once per box and reuse across ex,ey,ez instead of each compute_hist_and_cor call
+    #rebuilding the O(n_total) spatial mask itself (see docs/optimization_plan.md Phase 1)
+    dparsubset, _ = filter_dpar_to_box(dparticles, x1, x2, y1, y2, z1, z2)
+
+    vx, vy, vz, totalPtcl, Hist, CEx = compute_hist_and_cor(vmax, dv, x1, x2, y1, y2, z1, z2, dparticles, dfields, 'ex', 'x', dparsubset=dparsubset)
+    vx, vy, vz, totalPtcl, Hist, CEy = compute_hist_and_cor(vmax, dv, x1, x2, y1, y2, z1, z2, dparticles, dfields, 'ey', 'y', dparsubset=dparsubset)
+    vx, vy, vz, totalPtcl, Hist, CEz = compute_hist_and_cor(vmax, dv, x1, x2, y1, y2, z1, z2, dparticles, dfields, 'ez', 'z', dparsubset=dparsubset)
+
     return vx, vy, vz, totalPtcl, Hist, CEx, CEy, CEz
 
 def project_CEi_hist(Hist, CEx, CEy, CEz):
@@ -564,9 +621,12 @@ def compute_correlation_over_x(dfields, dparticles, vmax, dv, dx, vshock, xlim=N
 
     while(x2 <= xEnd):
         print('scan pos-> x1: ',x1,' x2: ',x2,' y1: ',y1,' y2: ',y2,' z1: ', z1,' z2: ',z2)
-        vx, vy, vz, totalPtcl, Hist, CEx = compute_hist_and_cor(vmax, dv, x1, x2, y1, y2, z1, z2, dparticles, dfields, 'ex', 'x')
-        vx, vy, vz, totalPtcl, Hist, CEy = compute_hist_and_cor(vmax, dv, x1, x2, y1, y2, z1, z2, dparticles, dfields, 'ey', 'y')
-        vx, vy, vz, totalPtcl, Hist, CEz = compute_hist_and_cor(vmax, dv, x1, x2, y1, y2, z1, z2, dparticles, dfields, 'ez', 'z')
+        #filter once per slice and reuse across ex,ey,ez instead of each compute_hist_and_cor call
+        #rebuilding the O(n_total) spatial mask itself (see docs/optimization_plan.md Phase 1)
+        dparsubset, _ = filter_dpar_to_box(dparticles, x1, x2, y1, y2, z1, z2)
+        vx, vy, vz, totalPtcl, Hist, CEx = compute_hist_and_cor(vmax, dv, x1, x2, y1, y2, z1, z2, dparticles, dfields, 'ex', 'x', dparsubset=dparsubset)
+        vx, vy, vz, totalPtcl, Hist, CEy = compute_hist_and_cor(vmax, dv, x1, x2, y1, y2, z1, z2, dparticles, dfields, 'ey', 'y', dparsubset=dparsubset)
+        vx, vy, vz, totalPtcl, Hist, CEz = compute_hist_and_cor(vmax, dv, x1, x2, y1, y2, z1, z2, dparticles, dfields, 'ez', 'z', dparsubset=dparsubset)
         print('number of particles found in box: ', totalPtcl)
         x_out.append(np.mean([x1,x2]))
         CEx_out.append(CEx)
@@ -1033,13 +1093,22 @@ def compute_cprime_hist(dparticles, dfields, fieldkey, vmax, dv, useBoxFAC=True,
     vzbins = np.arange(-vmax, vmax+dv, dv)
     vz = (vzbins[1:] + vzbins[:-1])/2.
 
-    #TODO: this is redundant (that is we compute the bins of particles twice, one with and one without the weight), fix with numpy and jit to save time
+    #bin the unweighted count (hist) and the cprimew-weighted sum (cprimebinned) in a single
+    #binning pass over the same samples, instead of calling np.histogramdd twice (once per
+    #weighting) - see docs/optimization_plan.md Phase 1
     if(vvkey in ['p1','p2','p3']):
-        hist,_ = np.histogramdd((dparticles['p3'], dparticles['p2'], dparticles['p1']), bins=[vzbins, vybins, vxbins])
-        cprimebinned,_ = np.histogramdd((dparticles['p3'], dparticles['p2'], dparticles['p1']), bins=[vzbins, vybins, vxbins], weights=cprimew)
+        sample = (dparticles['p3'], dparticles['p2'], dparticles['p1'])
     else:
-        hist,_ = np.histogramdd((dparticles['pperp2'], dparticles['pperp1'], dparticles['ppar']), bins=[vzbins, vybins, vxbins])
-        cprimebinned,_ = np.histogramdd((dparticles['pperp2'], dparticles['pperp1'], dparticles['ppar']), bins=[vzbins, vybins, vxbins], weights=cprimew)
+        sample = (dparticles['pperp2'], dparticles['pperp1'], dparticles['ppar'])
+    if(len(cprimew) == 0):
+        #binned_statistic_dd (unlike histogramdd) errors on an empty sample even with
+        #explicit bin edges given - match histogramdd's behavior of an all-zero result
+        nbins = (len(vzbins)-1, len(vybins)-1, len(vxbins)-1)
+        hist = np.zeros(nbins)
+        cprimebinned = np.zeros(nbins)
+    else:
+        _binnedstats, _, _ = binned_statistic_dd(sample, [np.ones(len(cprimew)), cprimew], statistic='sum', bins=[vzbins, vybins, vxbins])
+        hist, cprimebinned = _binnedstats[0], _binnedstats[1]
     del cprimew
 
     # make the bins 3d arrays

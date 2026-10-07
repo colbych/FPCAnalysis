@@ -54,16 +54,11 @@ beta0 = anl.compute_beta0_tristanmp1(params,inputs)
 
 dfields = dtr.load_fields(path,num,normalizeFields=True)
 
-dpar_elec, dpar_ion = dtr.load_particles(path,num,normalizeVelocity=True)
-
-dpar_ion = dtr.format_par_like_dHybridR(dpar_ion) #For now, we rename the particle data keys too look like the keys we used when processing dHybridR data so this data is compatible with our old routines
-dpar_elec = dtr.format_par_like_dHybridR(dpar_elec)
-
 #-------------------------------------------------------------------------------
 # slice data
 #-------------------------------------------------------------------------------
 #setup sweeping box
-if(xlim == None): 
+if(xlim == None):
      xlim = [dfields['ex_xx'][0],dfields['ex_xx'][-1]]
 if(ylim == None):
      ylim = [dfields['ex_yy'][0],dfields['ex_yy'][-1]]
@@ -79,21 +74,35 @@ y2 = ylim[1]
 z1 = zlim[0]
 z2 = zlim[1]
 dparkeys='p1 p2 p3 x1 x2 x3'.split()
+
+#dtr.load_particles(normalizeVelocity=True) normalizes positions by this same factor
+#(see data_tristan.py:load_particles) - xlim/ylim/zlim above are in that normalized
+#frame (they default from dfields, loaded with normalizeFields=True), but
+#load_particles' x1/x2/y1/y2/z1/z2 bounds filter the RAW (pre-normalization) position
+#arrays, so convert bounds to raw units before passing them in. See
+#docs/optimization_plan.md Phase 1.
+posnorm_scale = params['comp']*np.sqrt(params['massratio'])
+
 while(x2 <= xEnd):
     print("x1: ", x1, "x2: ", x2)
+
+    #load only this slice's particles directly (positions are filtered server-side via
+    #h5py boolean selection inside load_particles), instead of loading the whole frame
+    #once up front and masking it in memory on every iteration
+    dpar_elec, dpar_ion = dtr.load_particles(path,num,normalizeVelocity=True,
+                                              x1=x1*posnorm_scale, x2=x2*posnorm_scale,
+                                              y1=y1*posnorm_scale, y2=y2*posnorm_scale,
+                                              z1=z1*posnorm_scale, z2=z2*posnorm_scale)
+    dpar_ion = dtr.format_par_like_dHybridR(dpar_ion) #For now, we rename the particle data keys too look like the keys we used when processing dHybridR data so this data is compatible with our old routines
+    dpar_elec = dtr.format_par_like_dHybridR(dpar_elec)
+
     #write sliced data for ions
-    gptsparticle = (x1 <= dpar_ion['x1']) & (dpar_ion['x1'] <= x2) & (y1 <= dpar_ion['x2']) & (dpar_ion['x2'] <= y2) & (z1 <= dpar_ion['x3']) & (dpar_ion['x3'] <= z2)
-    _tempdpar = {}
-    for key in dparkeys:
-            _tempdpar[key] = dpar_ion[key][gptsparticle][:]
+    _tempdpar = {key: dpar_ion[key] for key in dparkeys}
     outflnm = outdirname + '/ion/' + '{:012.6f}'.format(x1) + '_' + '{:012.6f}'.format(x2)
     ddhr.write_particles_to_hdf5(_tempdpar,outflnm)
 
     #write sliced data for elecs
-    gptsparticle = (x1 <= dpar_elec['x1']) & (dpar_elec['x1'] <= x2) & (y1 <= dpar_elec['x2']) & (dpar_elec['x2'] <= y2) & (z1 <= dpar_elec['x3']) & (dpar_elec['x3'] <= z2)
-    _tempdpar = {}
-    for key in dparkeys:
-            _tempdpar[key] = dpar_elec[key][gptsparticle][:]
+    _tempdpar = {key: dpar_elec[key] for key in dparkeys}
     outflnm = outdirname + '/elec/' + '{:012.6f}'.format(x1) + '_' + '{:012.6f}'.format(x2)
     ddhr.write_particles_to_hdf5(_tempdpar,outflnm)
     x1 += dx

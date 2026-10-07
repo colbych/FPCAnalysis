@@ -188,7 +188,7 @@ def load_den(path,num,normalize=False):
 
     return load_fields(path,num,field_vars=den_vars,normalizeFields=normalize)
 
-def load_particles(path, num, normalizeVelocity=False,loaddebugsubset=False):
+def load_particles(path, num, normalizeVelocity=False,loaddebugsubset=False, x1=None, x2=None, y1=None, y2=None, z1=None, z2=None):
     """
     Loads TRISTAN particle data
 
@@ -200,6 +200,14 @@ def load_particles(path, num, normalizeVelocity=False,loaddebugsubset=False):
         frame of data this function will load
     normalizeVelocity : bool (opt)#TODO: rename
         normalizes velocity to v_thermal,species and position to d_i
+    x1,x2,y1,y2,z1,z2 : float, opt
+        if all six are given, filters particles down to this spatial box using h5py
+        boolean selection on the position keys (xe/ye/ze, xi/yi/zi) before pulling the
+        remaining keys - mirrors data_dhybridr.read_box_of_particles's approach, so a
+        caller only ever materializes the particles inside the box, not the full frame.
+        Bounds are inclusive, matching this library's filtering convention elsewhere
+        (see CLAUDE.md). Leave as default (None) for the original full-frame-load
+        behavior - the no-bounds call signature is unchanged.
 
     Returns
     -------
@@ -209,6 +217,8 @@ def load_particles(path, num, normalizeVelocity=False,loaddebugsubset=False):
         dictionary containing ion particle data
     """
 
+    usebounds = (x1 is not None and x2 is not None and y1 is not None and y2 is not None and z1 is not None and z2 is not None)
+
     dens_vars_elc = 'ue ve we xe ye ze gammae'.split()
     dens_vars_ion = 'ui vi wi xi yi zi gammai'.split()
 
@@ -216,8 +226,26 @@ def load_particles(path, num, normalizeVelocity=False,loaddebugsubset=False):
     pts_ion = {}
     with h5py.File(path + 'prtl.tot.' + num, 'r') as f:
 
+        if(usebounds):
+            #read each species' position arrays once, build the combined mask once,
+            #and reuse the already-filtered positions as output rather than reading
+            #them from the file a second time (see docs/optimization_plan.md Phase 1)
+            xe_full = f['xe'][:]
+            ye_full = f['ye'][:]
+            ze_full = f['ze'][:]
+            gptse = (x1 <= xe_full) & (xe_full <= x2) & (y1 <= ye_full) & (ye_full <= y2) & (z1 <= ze_full) & (ze_full <= z2)
+            posdata_elc = {'xe': xe_full[gptse], 'ye': ye_full[gptse], 'ze': ze_full[gptse]}
+
+            xi_full = f['xi'][:]
+            yi_full = f['yi'][:]
+            zi_full = f['zi'][:]
+            gptsi = (x1 <= xi_full) & (xi_full <= x2) & (y1 <= yi_full) & (yi_full <= y2) & (z1 <= zi_full) & (zi_full <= z2)
+            posdata_ion = {'xi': xi_full[gptsi], 'yi': yi_full[gptsi], 'zi': zi_full[gptsi]}
+
         for k in dens_vars_elc:
-            if(loaddebugsubset):
+            if(usebounds):
+                pts_elc[k] = posdata_elc[k] if k in posdata_elc else f[k][gptse]
+            elif(loaddebugsubset):
                 if(len(f[k]) > 1):
                     pts_elc[k] = f[k][::25]
                 else:
@@ -225,7 +253,9 @@ def load_particles(path, num, normalizeVelocity=False,loaddebugsubset=False):
             else:
                 pts_elc[k] = f[k][:] #note: velocity is in units γV_i/c
         for l in dens_vars_ion:
-            if(loaddebugsubset):
+            if(usebounds):
+                pts_ion[l] = posdata_ion[l] if l in posdata_ion else f[l][gptsi]
+            elif(loaddebugsubset):
                 if(len(f[k]) > 1):
                     pts_ion[l] = f[l][::25]
                 else:
@@ -233,11 +263,18 @@ def load_particles(path, num, normalizeVelocity=False,loaddebugsubset=False):
             else:
                 pts_ion[l] = f[l][:]
 
-        pts_elc['inde'] = f['inde'][:]
-        pts_ion['indi'] = f['indi'][:]
+        if(usebounds):
+            pts_elc['inde'] = f['inde'][gptse]
+            pts_ion['indi'] = f['indi'][gptsi]
 
-        pts_elc['proce'] = f['proce'][:]
-        pts_ion['proci'] = f['proci'][:]
+            pts_elc['proce'] = f['proce'][gptse]
+            pts_ion['proci'] = f['proci'][gptsi]
+        else:
+            pts_elc['inde'] = f['inde'][:]
+            pts_ion['indi'] = f['indi'][:]
+
+            pts_elc['proce'] = f['proce'][:]
+            pts_ion['proci'] = f['proci'][:]
 
     pts_elc['Vframe_relative_to_sim'] = 0. #tracks frame (along vx) relative to sim
     pts_ion['Vframe_relative_to_sim'] = 0. #tracks frame (along vx) relative to sim

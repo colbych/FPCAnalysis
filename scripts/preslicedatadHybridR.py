@@ -66,27 +66,17 @@ dfields = ddhr.field_loader(path=path_fields,num=numframe,is2d3v=is2d3v)
 if(not(is2d3v)): #TODO: add check_input for 2d3v
     anl.check_input(analysisinputflnm,dfields)
 
-#Load data using normal output files
+#Particle data for the non-restart path is now loaded per x-slice inside the sweep
+#loop below (via read_box_of_particles), instead of bulk-loading the whole xlim range
+#(or, with no limits at all, the whole frame via read_particles) up front and slicing
+#it in memory - see docs/optimization_plan.md Phase 1. Just resolve default limits here.
 if(not(use_restart)):
-    print("Loading particle data...")
-    #Load slice of particle data
-    if xlim is not None and ylim is not None and zlim is not None:
-        dparticles = ddhr.read_box_of_particles(path_particles, numframe, xlim[0], xlim[1], ylim[0], ylim[1], zlim[0], zlim[1], is2d3v=is2d3v)
-    #Load all data in unspecified limits and only data in bounds in specified limits
-    elif xlim is not None or ylim is not None or zlim is not None:
-        if xlim is None:
-            xlim = [dfields['ex_xx'][0],dfields['ex_xx'][-1]]
-        if ylim is None:
-            ylim = [dfields['ex_yy'][0],dfields['ex_yy'][-1]]
-        if zlim is None:
-            zlim = [dfields['ex_zz'][0],dfields['ex_zz'][-1]]
-        dparticles = ddhr.read_box_of_particles(path_particles, numframe, xlim[0], xlim[1], ylim[0], ylim[1], zlim[0], zlim[1], is2d3v=is2d3v)
-    #Load all the particles
-    else:
+    if xlim is None:
         xlim = [dfields['ex_xx'][0],dfields['ex_xx'][-1]]
+    if ylim is None:
         ylim = [dfields['ex_yy'][0],dfields['ex_yy'][-1]]
+    if zlim is None:
         zlim = [dfields['ex_zz'][0],dfields['ex_zz'][-1]]
-        dparticles = ddhr.read_particles(path_particles, numframe, is2d3v=is2d3v)
 
 #-------------------------------------------------------------------------------
 # slice data
@@ -112,6 +102,16 @@ while(x2 <= xEnd):
     print("x1: ", x1, "x2: ", x2)
     if(use_restart): #if we are using restart files, must load relevant files
         dparticles = ddhr.read_restart(path,verbose=True,xlim=[x1,x2],nthreads=1)
+    else:
+        #read_box_of_particles uses strict inequalities, but this script's spatial
+        #filtering convention (and the gptsparticle mask just below) is inclusive - so
+        #pad the per-slice box slightly on read to guarantee a particle sitting exactly
+        #on a slice boundary is still loaded; gptsparticle below still does the exact,
+        #authoritative inclusive filtering, so this padding cannot change which
+        #particles end up in the output, only whether a boundary-exact one could have
+        #been silently dropped before reaching that filter.
+        _pad = dx*1e-6
+        dparticles = ddhr.read_box_of_particles(path_particles, numframe, x1-_pad, x2+_pad, y1, y2, z1, z2, is2d3v=is2d3v)
     gptsparticle = (x1 <= dparticles['x1']) & (dparticles['x1'] <= x2) & (y1 <= dparticles['x2']) & (dparticles['x2'] <= y2) & (z1 <= dparticles['x3']) & (dparticles['x3'] <= z2)
     _tempdpar = {}
     for key in dparkeys:
