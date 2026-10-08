@@ -3671,10 +3671,20 @@ def split_by_init_speed(dpar0, dpar, speed, vkeys=None, verbose=False):
         IDkey1 = 'indi'
         IDkey2 = 'proci'
 
-    #make array that has unique ID for each particle
-    dpar0['uniqueID']  = np.array([int(str(a1).replace('.', '') + str(a2).replace('.', '')) for a1, a2 in zip(dpar0[IDkey1], dpar0[IDkey2])])
-    dpar['uniqueID']  = np.array([int(str(a1).replace('.', '') + str(a2).replace('.', '')) for a1, a2 in zip(dpar[IDkey1], dpar[IDkey2])])
-    
+    #make array that has unique ID for each particle - vectorized Cantor pairing of
+    #(IDkey1, IDkey2) instead of a per-particle Python loop doing str()/replace('.','')/int()
+    #(see docs/optimization_plan.md Phase 3). Cantor pairing is an exact bijection N x N -> N
+    #for non-negative integers, so it cannot introduce collisions the old string-concat scheme
+    #didn't already risk (e.g. (1,23) and (12,3) both concatenating to "123").
+    def _pair_ids(a, b):
+        a = np.round(np.asarray(a)).astype(np.int64)
+        b = np.round(np.asarray(b)).astype(np.int64)
+        s = a + b
+        return (s * (s + 1)) // 2 + b
+
+    dpar0['uniqueID'] = _pair_ids(dpar0[IDkey1], dpar0[IDkey2])
+    dpar['uniqueID'] = _pair_ids(dpar[IDkey1], dpar[IDkey2])
+
 
     keys = dpar.keys()
     dpar_main = {}
@@ -3729,8 +3739,8 @@ def split_by_init_speed(dpar0, dpar, speed, vkeys=None, verbose=False):
     
     # Split data
     for pkey in pardatakeys:
-        dpar_main[pkey] = np.array([dpar[pkey][_i] for _i in newmainindexes])
-        dpar_ring[pkey] = np.array([dpar[pkey][_i] for _i in newringindexes])
+        dpar_main[pkey] = dpar[pkey][newmainindexes]
+        dpar_ring[pkey] = dpar[pkey][newringindexes]
 
     return dpar_main, dpar_ring
 

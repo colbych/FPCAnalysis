@@ -6,6 +6,25 @@ import numpy as np
 
 from numba import jit
 
+def _build_velocity_grids(vx, vy, vz):
+    """
+    Builds 3D (vz,vy,vx)-shaped grids broadcasting the 1D vx/vy/vz bin-center
+    arrays, matching the _vx[k][j][i]=vx[i], _vy[k][j][i]=vy[j], _vz[k][j][i]=vz[k]
+    convention used throughout this module (previously three duplicated
+    triple-nested Python loops - see docs/optimization_plan.md Phase 3).
+
+    Parameters
+    ----------
+    vx, vy, vz : 1d arrays
+        velocity bin-center arrays
+
+    Returns
+    -------
+    _vx, _vy, _vz : 3d arrays, shape (len(vz), len(vy), len(vx))
+    """
+    _vz, _vy, _vx = np.meshgrid(vz, vy, vx, indexing='ij')
+    return _vx, _vy, _vz
+
 def filter_dpar_to_box(dpar, x1, x2, y1, y2, z1, z2):
     """
     Filters particle data down to the particles within the given spatial box.
@@ -184,28 +203,8 @@ def compute_hist_and_cor(vmax, dv, x1, x2, y1, y2, z1, z2,
         vz = (vzbins[1:] + vzbins[:-1])/2.
 
         # make the bins 3d arrays
-        _vx = np.zeros((len(vz), len(vy), len(vx)))
-        _vy = np.zeros((len(vz), len(vy), len(vx)))
-        _vz = np.zeros((len(vz), len(vy), len(vx)))
-        for i in range(0, len(vx)):
-            for j in range(0, len(vy)):
-                for k in range(0, len(vz)):
-                    _vx[k][j][i] = vx[i]
+        vx, vy, vz = _build_velocity_grids(vx, vy, vz)
 
-        for i in range(0, len(vx)):
-            for j in range(0, len(vy)):
-                for k in range(0, len(vz)):
-                    _vy[k][j][i] = vy[j]
-
-        for i in range(0, len(vx)):
-            for j in range(0, len(vy)):
-                for k in range(0, len(vz)):
-                    _vz[k][j][i] = vz[k]
-
-        vx = _vx
-        vy = _vy
-        vz = _vz
-    
         totalPtcl = 0
         hist = np.zeros(vx.shape)
         cor = np.zeros(vx.shape)
@@ -1113,27 +1112,7 @@ def compute_cprime_hist(dparticles, dfields, fieldkey, vmax, dv, useBoxFAC=True,
     del cprimew
 
     # make the bins 3d arrays
-    _vx = np.zeros((len(vz), len(vy), len(vx)))
-    _vy = np.zeros((len(vz), len(vy), len(vx)))
-    _vz = np.zeros((len(vz), len(vy), len(vx)))
-    for i in range(0, len(vx)):
-        for j in range(0, len(vy)):
-            for k in range(0, len(vz)):
-                _vx[k][j][i] = vx[i]
-
-    for i in range(0, len(vx)):
-        for j in range(0, len(vy)):
-            for k in range(0, len(vz)):
-                _vy[k][j][i] = vy[j]
-
-    for i in range(0, len(vx)):
-        for j in range(0, len(vy)):
-            for k in range(0, len(vz)):
-                _vz[k][j][i] = vz[k]
-
-    vx = _vx
-    vy = _vy
-    vz = _vz
+    vx, vy, vz = _build_velocity_grids(vx, vy, vz)
 
     return cprimebinned, hist, vx, vy, vz
 
@@ -1194,27 +1173,7 @@ def compute_hist(dparticles, dfields, vmax, dv, useFAC, useBoxFAC=True):
         hist,_ = np.histogramdd((dparticles['pperp2'], dparticles['pperp1'], dparticles['ppar']), bins=[vzbins, vybins, vxbins])
 
     # make the bins 3d arrays
-    _vx = np.zeros((len(vz), len(vy), len(vx)))
-    _vy = np.zeros((len(vz), len(vy), len(vx)))
-    _vz = np.zeros((len(vz), len(vy), len(vx)))
-    for i in range(0, len(vx)):
-        for j in range(0, len(vy)):
-            for k in range(0, len(vz)):
-                _vx[k][j][i] = vx[i]
-
-    for i in range(0, len(vx)):
-        for j in range(0, len(vy)):
-            for k in range(0, len(vz)):
-                _vy[k][j][i] = vy[j]
-
-    for i in range(0, len(vx)):
-        for j in range(0, len(vy)):
-            for k in range(0, len(vz)):
-                _vz[k][j][i] = vz[k]
-
-    vx = _vx
-    vy = _vy
-    vz = _vz
+    vx, vy, vz = _build_velocity_grids(vx, vy, vz)
 
     return hist, vx, vy, vz
 

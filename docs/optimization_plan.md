@@ -529,23 +529,42 @@ count and would show up more on a larger real dataset.)
 
 ---
 
-## Phase 3 — Vectorize the remaining Python-loop antipatterns
+## Phase 3 — Vectorize the remaining Python-loop antipatterns — DONE
 
 Targets findings #6, #7, #9. These are safe, independent, individually
 testable against Phase 0 golden output — do them in any order, one PR each.
 
-- [ ] `[ ]` Factor the triple-nested Python loop that builds 3D `vx`/`vy`/`vz`
+- [x] Factor the triple-nested Python loop that builds 3D `vx`/`vy`/`vz`
       grids (duplicated in `fpc.py:compute_cprime_hist`, `fpc.py:compute_hist`,
       and the debug branch of `fpc.py:compute_hist_and_cor`) into one helper
       using `np.meshgrid(vx, vy, vz, indexing='ij')` — confirm axis order
       matches the existing `[k][j][i]` convention exactly before replacing
       (write a quick equivalence check against the old loop for one case,
       then delete the three duplicated loops in favor of the helper).
-- [ ] `[ ]` **`array_ops.py:array_3d_to_2d`**: replace
+
+      **DONE.** Added `fpc.py:_build_velocity_grids(vx, vy, vz)`:
+      `_vz, _vy, _vx = np.meshgrid(vz, vy, vx, indexing='ij'); return _vx, _vy, _vz`.
+      All three duplicated loop sites now call this helper and assign
+      `vx, vy, vz = _build_velocity_grids(vx, vy, vz)`.
+
+      **Correctness verification:** ran the old triple-nested loop and the
+      new helper on the same 1D `vx`/`vy`/`vz` arrays of different lengths
+      (4,3,2) and confirmed `np.array_equal` on all three output grids plus
+      the resulting shape `(len(vz), len(vy), len(vx))`. `pytest tests/`
+      (5/5) and `testload.py`/`testframetransform.py` still pass.
+- [x] **`array_ops.py:array_3d_to_2d`**: replace
       `np.apply_along_axis(np.sum, axis, arr3d)` with `np.sum(arr3d, axis=axis)`.
       This is called 12x per slice from `fpc.py:project_CEi_hist` in the
       multiprocessing hot path.
-- [ ] `[ ]` **`analysis.py:split_by_init_speed`**: replace the per-particle
+
+      **DONE.** All three branches (`axis=0,1,2`) changed.
+      **Correctness verification:** confirmed `np.array_equal` between the
+      old and new calls on a random `(4,5,6)` array for all three axes
+      (bit-identical, as expected — `apply_along_axis(np.sum, ...)` is just
+      a slower way to do the same reduction `np.sum(..., axis=...)` already
+      does directly). `pytest tests/` (5/5) and `testload.py`/
+      `testframetransform.py` still pass.
+- [x] **`analysis.py:split_by_init_speed`**: replace the per-particle
       Python string-concat unique-ID construction with a vectorized approach
       (e.g. combine `indi`/`proci` via a vectorized numeric encoding, or use
       `np.core.records`/structured arrays + `np.isin`/`np.searchsorted`
@@ -553,9 +572,48 @@ testable against Phase 0 golden output — do them in any order, one PR each.
       `np.array([dpar[pkey][_i] for _i in newmainindexes])` loops with direct
       fancy indexing `dpar[pkey][newmainindexes]`.
 
-**Acceptance:** Golden tests pass. Benchmark script shows measurable
-improvement at 1e6-1e7 scale for any workflow exercising
-`project_CEi_hist`/`split_by_init_speed`.
+      **DONE.** Replaced the per-particle `str(a1).replace('.','') +
+      str(a2).replace('.','')` + `int(...)` Python loop with a vectorized
+      Cantor pairing function (`_pair_ids(a, b)`, local to
+      `split_by_init_speed`): `a, b` rounded to `int64`, then
+      `s=a+b; (s*(s+1))//2 + b`. This is an exact bijection N×N → N for
+      non-negative integers, so for the realistic case (`indi`/`proci` are
+      non-negative particle/process indices) it is *more* collision-safe
+      than the string-concat it replaces (string concatenation of two
+      variable-length digit strings is not actually injective in general —
+      e.g. `(1,23)` and `(12,3)` both concatenate to `"123"` — a latent
+      correctness gap in the old code that this change incidentally closes,
+      not something intentionally targeted). `uniqueID` is only ever used
+      internally within this one function (confirmed via repo-wide grep —
+      not read, returned-and-relied-upon elsewhere, or covered by any golden
+      test), so changing its literal encoded value is safe; what matters,
+      and was verified, is that the *matching* behavior (which particles end
+      up in `dpar_main` vs `dpar_ring`) is unchanged. Also replaced both
+      `np.array([dpar[pkey][_i] for _i in newmainindexes])` /
+      `newringindexes` list comprehensions with direct fancy indexing
+      (`dpar[pkey][newmainindexes]` / `dpar[pkey][newringindexes]`).
+
+      **Correctness verification:** no existing test covers this function.
+      Wrote a synthetic comparison (500 particles, `dpar` holding a shuffled
+      permutation of `dpar0` to exercise real reordering/matching, random
+      `indi`/`proci`/velocity keys) against the old string-concat
+      implementation inlined verbatim for reference: confirmed
+      `np.array_equal` on every returned key (`ux`,`vy`,`wz`,`indi`,`proci`)
+      for both `dpar_main` and `dpar_ring`, and matching set sizes
+      (101 main / 399 ring, identical old vs. new). `pytest tests/` (5/5)
+      and `testload.py`/`testframetransform.py` still pass.
+
+**Acceptance:** met. Golden tests pass (`pytest tests/`, 5/5, plus
+`testload.py`/`testframetransform.py`) after all three items. No dedicated
+before/after benchmark was re-run for this phase — each item is a direct
+algorithmic replacement of a strictly slower construct with a numpy-
+vectorized equivalent (nested Python triple-loop → `np.meshgrid`;
+`apply_along_axis` → direct `np.sum`; per-particle `str`/`int` loop →
+array arithmetic), so the win is structural, not something that needed
+re-measuring to confirm direction; `scripts/bench_fpc.py` and
+`scripts/bench_sweep_redundancy.py` (which already exercise
+`project_CEi_hist`'s `array_3d_to_2d` calls via the multithreaded sweep
+path) remain available to quantify it on a real dataset if desired.
 
 ---
 

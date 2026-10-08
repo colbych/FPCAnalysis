@@ -140,17 +140,17 @@ def array_3d_to_2d(arr3d, planename):
     ny = len(arr3d[0])
     nx = len(arr3d[0][0])
     if(planename == 'xy' or planename == 'parperp1'):
-        arr2d = np.apply_along_axis(np.sum, 0, arr3d)
+        arr2d = np.sum(arr3d, axis=0)
         arr2d = np.swapaxes(arr2d, 0, 1) #rest of the code assumes this ordering
         return arr2d
 
     elif(planename == 'xz' or planename ==  'parperp2'):
-        arr2d = np.apply_along_axis(np.sum, 1, arr3d)
+        arr2d = np.sum(arr3d, axis=1)
         arr2d = np.swapaxes(arr2d, 0, 1) #rest of the code assumes this ordering
         return arr2d
 
     elif(planename == 'yz' or planename == 'perp1perp2'):
-        arr2d = np.apply_along_axis(np.sum, 2, arr3d)
+        arr2d = np.sum(arr3d, axis=2)
         arr2d = np.swapaxes(arr2d, 0, 1) #rest of the code assumes this ordering
         return arr2d
     else:
