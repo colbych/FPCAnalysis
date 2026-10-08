@@ -111,6 +111,15 @@ def get_dpar_from_bounds(dpar_folder,x1,x2,verbose=False):
             leftmostbound_index -= 1
             return_rightmost = True
 
+    #leftmostbound_index starts at the sentinel -1 and only advances past files
+    #whose lower bound is strictly less than x1. When x1 exactly equals the
+    #leftmost file's lower bound (e.g. x1 is the domain's left edge), the loop
+    #above never executes and leftmostbound_index is left at -1 - which, as a
+    #Python slice start below, means "from the last file", not "from the
+    #first". Clamp it to 0 (the correct "no file found below x1, so start
+    #at the first file" case) before it's used for indexing.
+    if(leftmostbound_index < 0):
+        leftmostbound_index = 0
 
     if(not(return_rightmost)):
         rightmostbound_index = 0

@@ -481,11 +481,35 @@ Targets findings #3-#4.
       empty (or wrong) slice in Python, not "from the start". Reproduced
       with `get_dpar_from_bounds(presliced_dir, x1=<leftmost file's lower
       bound>, x2=...)` returning 0-1 particles instead of the real count.
-      Did not fix this - it's unrelated to Phase 2's scope (the polling
-      loop and `dfields` pickling) and changes `get_dpar_from_bounds`'s
-      return value for real callers, which deserves its own deliberate fix
-      and verification pass rather than a drive-by change. Flagged to the
-      user; worth a dedicated follow-up.
+      Did not fix within Phase 2 itself - it's unrelated to Phase 2's scope
+      (the polling loop and `dfields` pickling) and changes
+      `get_dpar_from_bounds`'s return value for real callers, which
+      deserved its own deliberate fix and verification pass rather than a
+      drive-by change. Flagged to the user; fixed as a dedicated follow-up
+      immediately after Phase 2 landed - see below.
+
+**Follow-up fix (post-Phase-2): `get_dpar_from_bounds` leftmost-boundary bug.**
+Root cause: `leftmostbound_index` starts at the sentinel `-1` and only
+advances past files whose lower bound is *strictly less than* `x1`. When
+`x1` exactly equals the leftmost presliced file's lower bound, that loop
+body never executes, so `leftmostbound_index` is left at `-1` -  which,
+used as the start of `filenames[leftmostbound_index:rightmostbound_index+1]`,
+means "from the last file" in Python slice semantics, not "from the
+first". Fixed by clamping `leftmostbound_index` to `0` (the correct "no
+file found below `x1`, so start at the first file" case) immediately after
+that loop, before it's used for indexing.
+
+**Correctness verification:** reproduced the bug against the pre-fix code
+(via `git stash`) on a synthetic 4-file presliced dataset
+(`[0,2),[2,4),[4,6),[6,8)`), requesting `x1=0.0` (the leftmost file's exact
+lower bound): pre-fix code hit the "no files found" fallback and returned
+a dummy 1-particle placeholder instead of the 10 real particles in files
+`[0,2)` and `[2,4)`; post-fix code returns the correct 10 particles. A
+normal interior-boundary case (`x1=3.0, x2=5.0`) was checked too and is
+unchanged (20 particles, same as before the fix) - this confirms the fix is
+targeted at the sentinel-clamping bug only, not a behavior change for the
+common case. `pytest tests/` (5/5) and `testload.py`/`testframetransform.py`
+still pass.
 
 **Acceptance:** Golden tests pass (`pytest tests/`, 5/5, plus `testload.py`/
 `testframetransform.py`). Wall-clock sweep time for a multi-slice
