@@ -375,6 +375,25 @@ def _grab_dpar_and_comp_all_CEi(vmax, dv, x1, x2, y1, y2, z1, z2, dpar_folder, d
     else:
         return vx, vy, vz, totalPtcl, Hist, CEx, CEy, CEz
 
+#module-level so each ProcessPoolExecutor worker process can hold its own copy,
+#set once via the executor's initializer instead of dfields being re-pickled and
+#sent as a per-task argument on every submit() call below - dfields is the same
+#object across every task in a sweep (see docs/optimization_plan.md Phase 2)
+_mp_worker_dfields = None
+
+def _init_mp_worker_dfields(dfields):
+    global _mp_worker_dfields
+    _mp_worker_dfields = dfields
+
+def _grab_dpar_and_comp_all_CEi_using_worker_dfields(vmax, dv, x1, x2, y1, y2, z1, z2, dpar_folder, vshock, project=False, betaiup=None, betai=None, betae=None, mi_me=None, isIon=None):
+    """
+    Thin wrapper around _grab_dpar_and_comp_all_CEi for use as a ProcessPoolExecutor
+    task: reads dfields from this worker process's _mp_worker_dfields (set once by
+    _init_mp_worker_dfields) instead of taking it as a per-task argument.
+    """
+    return _grab_dpar_and_comp_all_CEi(vmax, dv, x1, x2, y1, y2, z1, z2, dpar_folder, _mp_worker_dfields, vshock,
+                                        project=project, betaiup=betaiup, betai=betai, betae=betae, mi_me=mi_me, isIon=isIon)
+
 #TODO: update return documentation
 def comp_cor_over_x_multithread(dfields, dpar_folder, vmax, dv, dx, vshock, xlim=None, ylim=None, zlim=None, max_workers = 8, betaiup=None, betai=None, betae=None, mi_me=None, isIon=None):
     """
@@ -424,9 +443,7 @@ def comp_cor_over_x_multithread(dfields, dpar_folder, vmax, dv, dx, vshock, xlim
     num_par_out : 1d array
         number of particles in box
     """
-    from concurrent.futures import ProcessPoolExecutor
-    import time
-    import gc
+    from concurrent.futures import ProcessPoolExecutor, as_completed
 
     #set up box bounds
     if xlim is not None:
@@ -479,61 +496,45 @@ def comp_cor_over_x_multithread(dfields, dpar_folder, vmax, dv, dx, vshock, xlim
 
     num_par_out = [None for _tmp in x1task]
 
-    #do multithreading
-    with ProcessPoolExecutor(max_workers = max_workers) as executor:
-        futures = []
-        jobidxs = []
+    #do multithreading. dfields is passed once via the initializer (picked up by
+    #workers as _mp_worker_dfields), not as a per-task submit() argument, since it's
+    #the same object across every task here - see docs/optimization_plan.md Phase 2.
+    with ProcessPoolExecutor(max_workers = max_workers, initializer = _init_mp_worker_dfields, initargs = (dfields,)) as executor:
+        future_to_tskidx = {}
 
         #queue up jobs
-        for tskidx in range(0,len(x1task)): #if there is a free worker and job to do, give job
+        for tskidx in range(0,len(x1task)):
             print('queued scan pos-> x1: ',x1task[tskidx],' x2: ',x2task[tskidx],' y1: ',y1,' y2: ',y2,' z1: ', z1,' z2: ',z2)
             if(betai == None):
-                futures.append(executor.submit(_grab_dpar_and_comp_all_CEi, vmax, dv, x1task[tskidx], x2task[tskidx], y1, y2, z1, z2, dpar_folder, dfields, vshock, project=True, betaiup=betaiup))
+                future = executor.submit(_grab_dpar_and_comp_all_CEi_using_worker_dfields, vmax, dv, x1task[tskidx], x2task[tskidx], y1, y2, z1, z2, dpar_folder, vshock, project=True, betaiup=betaiup)
             else:
-                futures.append(executor.submit(_grab_dpar_and_comp_all_CEi, vmax, dv, x1task[tskidx], x2task[tskidx], y1, y2, z1, z2, dpar_folder, dfields, vshock, project=True, betai=betai, betae=betae, mi_me=mi_me, isIon=isIon))
-            jobidxs.append(tskidx)
+                future = executor.submit(_grab_dpar_and_comp_all_CEi_using_worker_dfields, vmax, dv, x1task[tskidx], x2task[tskidx], y1, y2, z1, z2, dpar_folder, vshock, project=True, betai=betai, betae=betae, mi_me=mi_me, isIon=isIon)
+            future_to_tskidx[future] = tskidx
 
-        #wait until finished
+        #wait until finished - process each result as soon as it's ready instead of
+        #polling every 10s (see docs/optimization_plan.md Phase 2)
         print("Done queueing up processes, waiting until done...")
-        not_finished = True
-        while(not_finished):
-            not_finished = False
-            if(len(futures) >= 0):
-                _i = 0
-                while(_i < len(futures)):
-                    if(not(futures[_i].done())):
-                        not_finished = True
-                        _i += 1
-                    else:
-                        tskidx = jobidxs[_i]
-                        _output = futures[_i].result() #return vx, vy, vz, totalPtcl, Hist, CEx, CEy, CEz
-                        print("Got result for x1: ",x1task[tskidx]," x2: ",x2task[tskidx],' npar:', _output[3])
-                        vx = _output[0]
-                        vy = _output[1]
-                        vz = _output[2]
-                        Histxy[tskidx] = _output[4]
-                        Histxz[tskidx] = _output[5]
-                        Histyz[tskidx] = _output[6]
-                        CExxy[tskidx] = _output[7]
-                        CExxz[tskidx] = _output[8]
-                        CExyz[tskidx] = _output[9]
-                        CEyxy[tskidx] = _output[10]
-                        CEyxz[tskidx] = _output[11]
-                        CEyyz[tskidx] = _output[12]
-                        CEzxy[tskidx] = _output[13]
-                        CEzxz[tskidx] = _output[14]
-                        CEzyz[tskidx] = _output[15]
-                        num_par_out[tskidx] = _output[3] 
-                        x_out[tskidx] = (x2task[tskidx]+x1task[tskidx])/2.
-
-                        #saves ram
-                        print("Deleting future for x1: ",x1task[tskidx]," x2: ",x2task[tskidx])
-                        del futures[_i]
-                        del jobidxs[_i]
-
-                        gc.collect()
-                        print("Done deleting (and garbage collecting) future for x1: ",x1task[tskidx]," x2: ",x2task[tskidx])
-                time.sleep(10.)
+        for future in as_completed(future_to_tskidx):
+            tskidx = future_to_tskidx.pop(future)
+            _output = future.result() #return vx, vy, vz, totalPtcl, Hist, CEx, CEy, CEz
+            print("Got result for x1: ",x1task[tskidx]," x2: ",x2task[tskidx],' npar:', _output[3])
+            vx = _output[0]
+            vy = _output[1]
+            vz = _output[2]
+            Histxy[tskidx] = _output[4]
+            Histxz[tskidx] = _output[5]
+            Histyz[tskidx] = _output[6]
+            CExxy[tskidx] = _output[7]
+            CExxz[tskidx] = _output[8]
+            CExyz[tskidx] = _output[9]
+            CEyxy[tskidx] = _output[10]
+            CEyxz[tskidx] = _output[11]
+            CEyyz[tskidx] = _output[12]
+            CEzxy[tskidx] = _output[13]
+            CEzxz[tskidx] = _output[14]
+            CEzyz[tskidx] = _output[15]
+            num_par_out[tskidx] = _output[3]
+            x_out[tskidx] = (x2task[tskidx]+x1task[tskidx])/2.
 
         print("Done with processes!")
         executor.shutdown() #will start to shut things down as resouces become free

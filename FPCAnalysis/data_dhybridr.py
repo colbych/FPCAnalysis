@@ -757,54 +757,25 @@ def read_restart(path,verbose=True,xlim=None,nthreads=1):
         pts = np.concatenate(pts_parts, axis=0)
 
     else:
-        from concurrent.futures import ProcessPoolExecutor
-
-        #empty results array
-        pts = PM.parts_from_num(procs[0])
+        from concurrent.futures import ProcessPoolExecutor, as_completed
 
         tasks = procs[1:]
 
-        #do multithreading
+        #do multithreading - submit every task up front (ProcessPoolExecutor's own
+        #pool already caps concurrency at nthreads, so no need to hand-roll that) and
+        #process each result as soon as it's ready via as_completed instead of
+        #polling with time.sleep(1) (see docs/optimization_plan.md Phase 2).
+        #collect each proc's array and concatenate once at the end, instead of
+        #re-concatenating the whole growing array on every completed task
+        #(quadratic reallocation - see docs/optimization_plan.md Phase 1/2)
+        pts_parts = [PM.parts_from_num(procs[0])]
         with ProcessPoolExecutor(max_workers = nthreads) as executor:
-            futures = []
-            jobids = [] #array to track where in results array result returned by thread should go
-            num_working = 0
-            tasks_completed = 0
-            taskidx = 0
-
-            while(tasks_completed < len(tasks)): #while there are jobs to do
-                if(num_working < nthreads and taskidx < len(tasks)): #if there is a free worker and job to do, give job
-                    if(verbose):
-                        print('Loading '+str(taskidx) + ' of ' + str(procs[-1]))
-                    futures.append(executor.submit(_multi_process_part_mapper,tasks[taskidx],path))
-                    jobids.append(taskidx)
-                    taskidx += 1
-                    num_working += 1
-                else:
-                    exists_idle = False
-                    nft = len(futures)
-                    _i = 0
-                    while(_i < nft):
-                        if(futures[_i].done()): #if done get result
-                            #get results and place in return vars
-                            resultidx = jobids[_i]
-                            _output = futures[_i].result() #return vx, vy, vz, totalPtcl, totalFieldpts, Hist, CEx, CEy, CEz
-                            pts = np.concatenate([pts,_output],axis=0)
-
-                            if(verbose):
-                                print('Loaded '+str(resultidx) + ' of ' + str(procs[-1]))
-
-                            #update multithreading state vars
-                            num_working -= 1
-                            tasks_completed += 1
-                            exists_idle = True
-                            futures.pop(_i)
-                            jobids.pop(_i)
-                            nft -= 1
-                            _i += 1
-
-                    if(not(exists_idle)):
-                        time.sleep(1)
+            futures = [executor.submit(_multi_process_part_mapper, t, path) for t in tasks]
+            for _c, future in enumerate(as_completed(futures)):
+                pts_parts.append(future.result())
+                if(verbose):
+                    print('Loaded '+str(_c+1) + ' of ' + str(len(tasks)))
+        pts = np.concatenate(pts_parts, axis=0)
 
     dpar = _pts_to_par_dict(pts)
     if('SP01' in path or 'Sp01' in path or 'sp01' in path):

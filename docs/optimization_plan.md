@@ -419,21 +419,89 @@ Phase 1 didn't touch, are unchanged as expected).
 
 Targets findings #3-#4.
 
-- [ ] `[ ]` **`fpc.py:comp_cor_over_x_multithread`**: replace the hand-rolled
-      `while not_finished: ... time.sleep(10)` polling loop with
-      `concurrent.futures.as_completed(futures)`.
-- [ ] `[ ]` **`data_dhybridr.py:read_restart`** multithreaded path: same fix,
-      replace `time.sleep(1)` busy-wait with `as_completed`.
-- [ ] `[ ]` Confirm `dfields` isn't being needlessly re-pickled per task if
-      it doesn't have to be — check whether `ProcessPoolExecutor`'s
-      `initializer`/`initargs` (load `dfields` once per worker process) is a
-      better fit than passing it as a per-task argument, given it's the same
-      object across all tasks in a sweep.
+- [x] **`fpc.py:comp_cor_over_x_multithread`** — DONE. Replaced the
+      hand-rolled `while not_finished: ... time.sleep(10)` polling loop
+      (which re-scanned every pending future each cycle and could add up to
+      10s of pure dead time after a result was actually ready) with
+      `concurrent.futures.as_completed(future_to_tskidx)`, keyed by a
+      `{future: tskidx}` dict instead of the old parallel `futures`/`jobidxs`
+      lists. Also submits all tasks up front rather than manually throttling
+      - `ProcessPoolExecutor(max_workers=...)` already caps concurrency
+      itself, so the old code's throttling was reimplementing something the
+      executor already does.
+- [x] **`data_dhybridr.py:read_restart`** multithreaded path — DONE. Same
+      `as_completed` fix for the `time.sleep(1)` busy-wait. Incidentally,
+      this path referenced `time.sleep(1)` without ever importing `time` -
+      a latent `NameError` that would only fire the first time no future was
+      yet done, i.e. likely never actually exercised before. While rewriting
+      this block also applied the Phase 1 list-collect-then-concatenate-once
+      fix here too (the multithreaded path had the *same* quadratic
+      `np.concatenate([pts,_output],axis=0)`-per-completed-task pattern as
+      the single-threaded path Phase 1 already fixed - not called out
+      separately in Phase 1's checklist, but the same bug, caught while
+      already rewriting this exact block for the `as_completed` change, so
+      fixed here rather than left half-done).
+- [x] **`dfields` re-pickling** — DONE. Added a module-level
+      `_mp_worker_dfields` global set once per worker process via
+      `ProcessPoolExecutor(..., initializer=_init_mp_worker_dfields,
+      initargs=(dfields,))`, and a thin
+      `_grab_dpar_and_comp_all_CEi_using_worker_dfields` wrapper that reads
+      it instead of taking `dfields` as a per-task argument. `dfields` is
+      now pickled once per worker process instead of once per
+      `executor.submit()` call (i.e. once per slice in a sweep).
 
-**Acceptance:** Golden tests pass. Benchmark script shows wall-clock sweep
-time for a multi-slice run improves measurably (record in table) and CPU
-utilization across workers is more even during the run (spot-check with
-`top`/`htop` during a bench run, not a hard automated gate).
+      **Correctness verification:** no existing test exercises
+      `comp_cor_over_x_multithread` end-to-end (no presliced-particle
+      fixture in this repo). Built a synthetic presliced dataset + the real
+      field fixture, ran `comp_cor_over_x_multithread` and the already-
+      trusted serial `compute_correlation_over_x` over the identical
+      particles/box/field data, and compared `num_par`, the projected
+      `Hist`, and one projected `CE*` component across all slices -
+      bit-identical (`rtol=1e-6` to `1e-8`, consistent with the serial path's
+      own tolerance). For `read_restart`'s multithreaded path, a full restart-
+      file fixture would require replicating `PartMapper3D`'s binary format
+      and dHybridR input-file parsing - disproportionate for this change, so
+      (as in Phase 1 for this same function) verified the
+      submit-all/`as_completed`/collect-then-concatenate-once pattern in
+      isolation against the original polling pattern with a dummy picklable
+      worker function, confirming both produce the same multiset of results
+      regardless of completion order (which was already non-deterministic
+      in the original multithreaded code, so this is not a behavior change).
+
+      **Found along the way, not fixed (out of scope for this phase):**
+      `data_dhybridr.py:get_dpar_from_bounds` has a pre-existing bug, present
+      since before any of this optimization effort (confirmed against
+      `57500f9`, i.e. predates Phase 0 too) - when a requested `x1` exactly
+      equals the lower bound of the leftmost presliced file (a common case:
+      it's what you get by default if a sweep's `xlim[0]` is the domain's
+      left edge, which is also the typical `xlim[0]` the preslicing scripts
+      themselves used), `leftmostbound_index` stays at its sentinel value of
+      `-1`, and `filenames[leftmostbound_index:rightmostbound_index+1]` -
+      i.e. `filenames[-1:2]` - means "from the last file to index 2", an
+      empty (or wrong) slice in Python, not "from the start". Reproduced
+      with `get_dpar_from_bounds(presliced_dir, x1=<leftmost file's lower
+      bound>, x2=...)` returning 0-1 particles instead of the real count.
+      Did not fix this - it's unrelated to Phase 2's scope (the polling
+      loop and `dfields` pickling) and changes `get_dpar_from_bounds`'s
+      return value for real callers, which deserves its own deliberate fix
+      and verification pass rather than a drive-by change. Flagged to the
+      user; worth a dedicated follow-up.
+
+**Acceptance:** Golden tests pass (`pytest tests/`, 5/5, plus `testload.py`/
+`testframetransform.py`). Wall-clock sweep time for a multi-slice
+multithreaded run improved measurably: a 7-slice synthetic sweep with
+`max_workers=4` went from **20.3s to 4.6s (4.4x)** on the same
+machine/env as Phase 0/1, comparing the old polling implementation
+(via `git stash`) against the new `as_completed` implementation on
+identical inputs. This matches the predicted mechanism exactly: with 7
+tasks and 4 workers, the old loop needed 2 polling cycles to drain all
+results, each one paying the full `time.sleep(10)` regardless of how
+quickly the tasks actually finished (each task here ran in well under a
+second) - a ~20s floor with no relationship to actual compute time, which
+`as_completed` removes entirely. (Not separately isolated: the `dfields`
+re-pickling fix's own contribution to this number, since this fixture's
+`dfields` is small; its benefit scales with field-grid size and slice
+count and would show up more on a larger real dataset.)
 
 ---
 
